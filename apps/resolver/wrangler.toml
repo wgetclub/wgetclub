@@ -1,0 +1,90 @@
+name = "wgetclub-resolver"
+main = "src/index.ts"
+compatibility_date = "2026-01-15"
+compatibility_flags = ["nodejs_compat"]
+
+# The resolver serves the frontend AND resolves the names. This is not a reversal of
+# the docs/FREE_TIER.md decision — it is what makes that decision implementable.
+#
+# The earlier attempt was: Pages at the root, resolver at wget.club/*. That does not
+# exist. A Worker route takes precedence over a Pages custom domain on the same host,
+# so `wget.club/*` swallowed the landing page and the frontend never rendered. Worse:
+# `/` fell through to systemRoute()'s default and answered with a redirect to itself —
+# infinite loop.
+#
+# With [assets], a request matching a file in dist is served straight from the edge and
+# does NOT count as a Worker invocation — the same saving Pages gave us. What does not
+# match (that is, every name) falls through to the Worker. `not_found_handling` stays
+# "none" on purpose: "single-page-application" would hand back index.html for /myscript,
+# and the user would get HTML instead of the script — the `| bash` would swallow the
+# landing page.
+workers_dev = false
+
+[assets]
+directory = "../web/dist"
+binding = "ASSETS"
+not_found_handling = "none"
+
+[[routes]]
+pattern = "wget.club/*"
+zone_name = "wget.club"
+
+[observability]
+enabled = true
+
+# name → {cid, ct, owner, frozen, updatedAt, tokenId}
+# Free tier: 100k reads/day, 1k WRITES/day. The write cap is the tight one —
+# the resolver only writes on a cold-cache chain fallback, never on the hot path.
+[[kv_namespaces]]
+binding = "NAMES"
+# Filled in by: node scripts/bootstrap-cloudflare.mjs
+id = "c84fb9ee07304397be01df29955342f0"
+
+# No `preview_id`: it is only used by `wrangler dev` in remote mode, and this project's
+# dev runs --local against wrangler.e2e.toml, which has its own namespace. There used to
+# be a TODO_KV_PREVIEW_ID here that no script ever filled in — an eternal placeholder in
+# a config is a trap: it looks like a pending task, it disappears into the noise, and one
+# day someone "fixes" it by pointing it at the wrong namespace.
+
+# R2 — OPTIONAL, and commented out by default.
+#
+# R2 DEMANDS A CARD ON FILE even on the free tier. This is not an account detail: it is
+# a barrier that stops the project from shipping at all. Without this binding, the
+# resolver caches the bytes in KV and the abuse queue goes to KV too — the product works
+# exactly the same, with less headroom (1GB vs 10GB). See apps/resolver/src/blobs.ts.
+#
+# If you do have a card, enable R2 in the dashboard, uncomment, and run
+# `node scripts/bootstrap-cloudflare.mjs`. Not one line of code changes.
+#
+# [[r2_buckets]]
+# binding = "BLOBS"
+# bucket_name = "wgetclub-blobs"
+# preview_bucket_name = "wgetclub-blobs-preview"
+
+[vars]
+IPFS_GATEWAYS = "https://w3s.link/ipfs,https://ipfs.io/ipfs,https://dweb.link/ipfs"
+CONTRACT_ADDRESS = "0xbD74AEb4B8Cb4211B4701e4614Dcf56eD7d7a999"  # Base mainnet (DAO-owned)
+
+# BASE_RPC_URL is a secret, not a var: the public https://mainnet.base.org is rate
+# limited hard enough to be a liability on the cold path. Use an Alchemy/QuickNode
+# free-tier key.  →  wrangler secret put BASE_RPC_URL
+# [vars] BASE_RPC_URL — DO NOT set here.
+
+[env.staging]
+name = "wgetclub-resolver-staging"
+workers_dev = true
+
+# Bindings are NOT inherited by named environments (wrangler warns, then deploys
+# anyway). Without these, `wrangler deploy --env staging` ships a worker with no
+# KV and no R2. Any binding added at the top level must be added here too.
+[[env.staging.kv_namespaces]]
+binding = "NAMES"
+id = "TODO_KV_STAGING_ID"
+
+# [[env.staging.r2_buckets]]
+# binding = "BLOBS"
+# bucket_name = "wgetclub-blobs-staging"
+
+[env.staging.vars]
+IPFS_GATEWAYS = "https://w3s.link/ipfs,https://ipfs.io/ipfs,https://dweb.link/ipfs"
+CONTRACT_ADDRESS = "0x0000000000000000000000000000000000000000"  # TODO: Base Sepolia deploy

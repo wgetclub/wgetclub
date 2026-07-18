@@ -1,0 +1,90 @@
+name = "wgetclub-api"
+main = "src/index.ts"
+compatibility_date = "2026-01-15"
+compatibility_flags = ["nodejs_compat"]
+
+workers_dev = false
+
+# /api/* only. The resolver owns the bare-name routes and Pages owns everything
+# else — the split keeps static assets off the 100k req/day Worker budget.
+# See docs/FREE_TIER.md §4.5.
+[[routes]]
+pattern = "wget.club/api/*"
+zone_name = "wget.club"
+
+[observability]
+enabled = true
+
+# The indexer. 1 minute is the floor: each tick is a Worker request, so 1/min is
+# 1440/day (1.4% of the free quota) while 10s would be 8640/day. See docs/FREE_TIER.md §1.1.
+# The cron is a backstop, not the critical path — POST /api/refresh/:name keeps the
+# post-tx UX instant, and the resolver falls back to the chain on a KV miss.
+[triggers]
+crons = ["* * * * *"]
+
+# Same namespace as the resolver — this worker is the writer, the resolver is the
+# reader. Free tier: 1k WRITES/day, which is the tightest limit in the system.
+# Every put() in this worker must justify itself. See docs/FREE_TIER.md §2.1.
+[[kv_namespaces]]
+binding = "NAMES"
+# Filled in by: node scripts/bootstrap-cloudflare.mjs
+# MUST match apps/resolver/wrangler.toml — the api writes n:<name>, the resolver reads it.
+id = "c84fb9ee07304397be01df29955342f0"
+
+# Shared with the resolver: `blob/<cid>` is the hot byte cache. This worker also
+# writes `abuse/<id>.json` here rather than to KV — abuse reports are attacker-
+# triggerable writes, and R2 gives 1M/month vs KV's 1k/day.
+# R2 — OPTIONAL, and commented out by default.
+#
+# R2 DEMANDS A CARD ON FILE even on the free tier. This is not an account detail: it is
+# a barrier that stops the project from shipping at all. Without this binding, the
+# resolver caches the bytes in KV and the abuse queue goes to KV too — the product works
+# exactly the same, with less headroom (1GB vs 10GB). See apps/resolver/src/blobs.ts.
+#
+# If you do have a card, enable R2 in the dashboard, uncomment, and run
+# `node scripts/bootstrap-cloudflare.mjs`. Not one line of code changes.
+#
+# [[r2_buckets]]
+# binding = "BLOBS"
+# bucket_name = "wgetclub-blobs"
+# preview_bucket_name = "wgetclub-blobs-preview"
+
+[vars]
+CONTRACT_ADDRESS = "0xbD74AEb4B8Cb4211B4701e4614Dcf56eD7d7a999"  # Base mainnet (DAO-owned)
+# Block the registry was deployed at. The indexer starts here on a cold cursor;
+# scanning from 0 on Base would be millions of empty blocks.
+START_BLOCK = "48773522"                                         # Base mainnet deploy block
+# Gates CORS (localhost is only allowed off production) and nothing else.
+ENVIRONMENT = "production"
+
+# Secrets — set with `wrangler secret put <NAME>`, never in [vars]:
+#   BASE_RPC_URL      Alchemy/QuickNode key. The public https://mainnet.base.org is
+#                     rate limited too hard for the indexer's eth_getLogs.
+#   PINATA_JWT        Pinning API token. Leaking it means someone else pins on our bill.
+#   SESSION_SECRET    HMAC key for the session JWT. `openssl rand -hex 32`.
+#   ADMIN_ADDRESSES   Comma-separated lowercase addresses allowed to POST /api/admin/block.
+#                     A secret rather than a var so the takedown allowlist is not public.
+
+[env.staging]
+name = "wgetclub-api-staging"
+workers_dev = true
+
+# Bindings are NOT inherited by named environments — wrangler warns about this and
+# then deploys anyway. Without these repeated here, `wrangler deploy --env staging`
+# ships a worker with no KV and no R2, which fails at the first request rather than
+# at deploy. Any binding added at the top level must be added here too.
+[[env.staging.kv_namespaces]]
+binding = "NAMES"
+id = "TODO_KV_STAGING_ID"
+
+# [[env.staging.r2_buckets]]
+# binding = "BLOBS"
+# bucket_name = "wgetclub-blobs-staging"
+
+[env.staging.triggers]
+crons = ["*/5 * * * *"]
+
+[env.staging.vars]
+CONTRACT_ADDRESS = "0x0000000000000000000000000000000000000000"  # TODO: Base Sepolia deploy
+START_BLOCK = "0"                                                # TODO: Sepolia deploy block
+ENVIRONMENT = "staging"
