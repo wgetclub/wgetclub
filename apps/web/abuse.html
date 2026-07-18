@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>report abuse — wget.club</title>
+    <meta
+      name="description"
+      content="Report a name that serves malware, phishing or illegal content, or appeal a block."
+    />
+    <link rel="icon" href="/favicon.ico" />
+    <!--
+      Its own entry point, not an SPA route. The resolver serves dist via [assets] with
+      not_found_handling="none": /abuse only reaches the user if it matches a built
+      file. As an SPA route it would fall through to the Worker and become a 404 —
+      which is where this link pointed before this page existed.
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/abuse.tsx"></script>
+  </body>
+</html>

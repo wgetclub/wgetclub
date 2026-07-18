@@ -1,0 +1,228 @@
+name: deploy
+
+# Deploys both Workers + builds the frontend.
+#
+# Prerequisites NO script does for you (see docs/RUNBOOK.md):
+#   1. the contract deployed on Base Sepolia, and the address pasted into all 3 places
+#   2. `node scripts/bootstrap-cloudflare.mjs` run (creates the KV and writes the ids)
+#   3. repository secrets on GitHub:
+#        CLOUDFLARE_API_TOKEN   token with Workers Scripts:Edit + Workers KV:Edit (R2:Edit only if you use R2)
+#        CLOUDFLARE_ACCOUNT_ID
+#   4. Worker secrets, via `wrangler secret put` (they do NOT belong here — see docs/RUNBOOK.md)
+#
+# Nothing here deploys the contract. A contract is not fixed by redeploying; it is a
+# manual, deliberate step, done once.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Two simultaneous deploys would leave resolver and api on different versions,
+  # talking to KVs in different states. One at a time.
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # NO `version:` — pnpm/action-setup@v4 ABORTS if the version comes from two
+      # places, and package.json already declares `packageManager: pnpm@9.12.0`.
+      # Duplicating it here gets you:
+      #   Error: Multiple versions of pnpm specified
+      # packageManager is the single source: it also governs the local pnpm of
+      # whoever clones this. Pinning the version in the workflow would only create a
+      # second truth to drift from the first.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - name: typecheck
+        run: pnpm -r typecheck
+
+      # Foundry in a SEPARATE step from its use, and this is not style: `$GITHUB_PATH`
+      # only affects SUBSEQUENT steps. While install and use lived in the same step,
+      # the `command -v forge` in setup-deps.sh found nothing and the script exited 1
+      # — this workflow would have failed on its very first run, and nobody would have
+      # seen it, because nothing was ever deployed.
+      # Official action, not `curl | bash`. The Foundry installer uses
+      #   BASE_DIR="${XDG_CONFIG_HOME:-$HOME}"
+      # and the GitHub runner SETS XDG_CONFIG_HOME (/home/runner/.config), so foundryup
+      # lands in ~/.config/.foundry/bin — not ~/.foundry/bin. The previous version
+      # called "$HOME/.foundry/bin/foundryup" and died with exit 127. It passed locally
+      # only because on a dev box XDG_CONFIG_HOME is usually unset.
+      #
+      # The action works out the PATH by itself, caches the binaries too, and is
+      # maintained by Foundry itself — three reasons not to hand-roll the path.
+      - name: foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: contracts
+        run: |
+          ./scripts/setup-deps.sh
+          cd contracts && forge build
+
+      # A Worker pointing at 0x0 answers 404 for EVERY name, silently: the service
+      # looks empty, not broken. Better to fail here, loudly.
+      #
+      # `grep -m1`, and that is the whole point: each wrangler.toml has TWO
+      # CONTRACT_ADDRESS entries and TWO KV ids — the production one and the one in the
+      # [env.staging] block, which sits at 0x0 and TODO on purpose, because staging was
+      # never deployed. A bare grep matched the staging one and failed forever, even
+      # with production fully configured. Only the FIRST occurrence (the production
+      # [vars] block) is what this gate measures.
+      - name: production config filled in?
+        run: |
+          fail=0
+          for f in apps/resolver/wrangler.toml apps/api/wrangler.toml; do
+            addr=$(grep -m1 '^CONTRACT_ADDRESS' "$f" | grep -oE '0x[0-9a-fA-F]{40}' || true)
+            if [ "$addr" = "0x0000000000000000000000000000000000000000" ] || [ -z "$addr" ]; then
+              echo "::error::$f: production CONTRACT_ADDRESS is 0x0. Deploy the contract and paste the address (docs/RUNBOOK.md step 2)."
+              fail=1
+            fi
+            kv=$(grep -m1 '^id = ' "$f" | sed 's/.*"\(.*\)".*/\1/' || true)
+            case "$kv" in
+              TODO*|"") echo "::error::$f: production KV id is '$kv'. Run: node scripts/bootstrap-cloudflare.mjs"; fail=1 ;;
+            esac
+          done
+
+          # START_BLOCK=0 makes the indexer sweep the chain from genesis: 44M empty
+          # blocks on Base, and the cursor resets to zero on every cold cron isolate. It
+          # NEVER catches up to the contract — and nothing errors, the indexer just
+          # never indexes. The `forge script` prints the right value at deploy time.
+          sb=$(grep -m1 '^START_BLOCK' apps/api/wrangler.toml | grep -oE '[0-9]+' || echo 0)
+          if [ "$sb" = "0" ]; then
+            echo "::error::apps/api/wrangler.toml: START_BLOCK=0. The indexer would sweep the chain from block 0 and never reach the contract. Use the deploy block (the forge script prints it). See docs/RUNBOOK.md step 2.5."
+            exit 1
+          fi
+          [ "$fail" = "0" ] || exit 1
+          echo "production: contract and KV configured"
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    # NO `environment:`, and this was a real bug.
+    #
+    # There used to be `environment: production` here. A GitHub Environment scopes its
+    # secrets ONLY to jobs that declare that exact name — and the RUNBOOK said to create
+    # the secrets under "Settings -> Secrets and variables -> Actions", which is the
+    # REPOSITORY level. Doc and workflow asked for different things: the owner created
+    # the secrets in an Environment called `sepolia`, the job asked for `production`,
+    # and wrangler died with "necessary to set a CLOUDFLARE_API_TOKEN" — with nothing
+    # pointing at the cause.
+    #
+    # Repository secrets apply to any job, which is what the doc describes.
+    # Environments are a good lock — required reviewers before a deploy — but that is
+    # mainnet hardening, and the cost of demanding them now was this bug. If you do add
+    # them, the name here and the name in the panel have to match.
+    steps:
+      # Fail here, not 3 minutes later. Without this gate, a missing secret only
+      # surfaced at the end, as a generic wrangler error ("necessary to set a
+      # CLOUDFLARE_API_TOKEN environment variable") — after installing everything and
+      # building the contract and the frontend. The error is the same; the time it takes
+      # you to understand it is not.
+      - name: GitHub secrets set?
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          fail=0
+          [ -n "$TOKEN" ]   || { echo "::error::CLOUDFLARE_API_TOKEN is not set (Settings -> Secrets and variables -> Actions)"; fail=1; }
+          [ -n "$ACCOUNT" ] || { echo "::error::CLOUDFLARE_ACCOUNT_ID is not set. Get it with: npx wrangler whoami"; fail=1; }
+          if [ "$fail" = "1" ]; then
+            echo "::error::The token needs the 'Edit Cloudflare Workers' template — it includes Zone > Workers Routes > Edit, without which the deploy fails to create the wget.club/* route. See docs/RUNBOOK.md step 5."
+            exit 1
+          fi
+          echo "secrets present"
+
+      - uses: actions/checkout@v4
+      # NO `version:` — pnpm/action-setup@v4 ABORTS if the version comes from two
+      # places, and package.json already declares `packageManager: pnpm@9.12.0`.
+      # Duplicating it here gets you:
+      #   Error: Multiple versions of pnpm specified
+      # packageManager is the single source: it also governs the local pnpm of
+      # whoever clones this. Pinning the version in the workflow would only create a
+      # second truth to drift from the first.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # The resolver serves the frontend via [assets], so dist has to exist BEFORE the
+      # resolver is deployed — otherwise you ship a Worker whose binding points at an
+      # empty directory and wget.club/ starts 404ing with no error at deploy time.
+      # VITE_CHAIN is EXPLICIT, not implicit. The build talks to ONE network
+      # (apps/web/src/chain.ts) and the default is base-sepolia — which is correct
+      # today, but a default that is correct by accident is exactly the kind of thing
+      # that becomes an incident the day someone deploys the contract to mainnet and
+      # forgets the frontend: the UI would check availability and quote prices against
+      # the testnet registry while the resolver reads the mainnet one. Nothing would
+      # throw; only the numbers would be wrong.
+      #
+      # To go to mainnet: Settings -> Secrets and variables -> Actions -> Variables
+      # -> CHAIN = base. And deploy the contract to mainnet FIRST.
+      - name: frontend build
+        env:
+          VITE_CHAIN: ${{ vars.CHAIN || 'base-sepolia' }}
+        run: pnpm --filter @wgetclub/web build
+
+      # Order matters. The resolver is the hot path and what the world sees; the api is
+      # only used by people who are buying. Shipping the api first means a contract
+      # mismatch between the two lasts seconds, not a whole deploy.
+      - name: api
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/api
+          command: deploy
+
+      - name: resolver
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/resolver
+          command: deploy
+
+      - name: smoke
+        run: |
+          # Retry, not `sleep 10`.
+          #
+          # The Worker route takes more than 10s to propagate after a deploy, and the
+          # fixed sleep failed a deploy that was RIGHT: 522 in CI, 200 a minute later. A
+          # magic number that sometimes suffices is worse than not waiting at all — it
+          # teaches you to ignore the red.
+          #
+          # A 522 here means "Cloudflare is in the path but the route hasn't taken yet,
+          # so it tried the 100:: origin and gave up" — which is exactly the transient
+          # state every deploy passes through.
+          probe() {
+            for i in $(seq 1 20); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "$1" || echo 000)
+              [ "$code" = "200" ] && { echo "  $1 -> 200 (attempt $i)"; return 0; }
+              echo "  $1 -> $code, waiting for propagation... ($i/20)"
+              sleep 6
+            done
+            echo "::error::$1 answered $code after 2min. 522 = the Worker route never took; 000 = DNS."
+            return 1
+          }
+
+          probe https://wget.club/_health || exit 1
+
+          # The landing page comes from the [assets] binding of the SAME Worker. If dist
+          # didn't ship with it, this 404s while /_health stays green — the service looks
+          # up and the front door is dead. No retry: if /_health answered, the route has
+          # already propagated, and a 404 here is real.
+          root=$(curl -s -o /dev/null -w '%{http_code}' https://wget.club/)
+          [ "$root" = "200" ] || { echo "::error::wget.club/ answered $root — the frontend did not ship with the resolver"; exit 1; }
+
+          echo "resolver and landing ok"

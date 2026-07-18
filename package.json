@@ -1,0 +1,17 @@
+{
+  "name": "wgetclub",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "dev": "pnpm --parallel --filter \"./apps/*\" dev",
+    "typecheck": "pnpm -r typecheck",
+    "deploy:resolver": "pnpm --filter @wgetclub/resolver deploy",
+    "deploy:api": "pnpm --filter @wgetclub/api deploy",
+    "build:web": "pnpm --filter @wgetclub/web build"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

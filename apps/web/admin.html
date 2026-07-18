@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>admin — wget.club</title>
+    <link rel="icon" href="/favicon.ico" />
+    <!--
+      Its own entry point, not an SPA route. The resolver serves dist via [assets] with
+      not_found_handling="none": /admin only reaches the user if it matches a built
+      file. `admin` is a reserved name (packages/shared/src/name.ts), so it can never
+      be bought and shadowed. The page holds no secret — every admin power is gated
+      server-side by ADMIN_ADDRESSES + a SIWE session — so serving it to everyone is safe.
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/admin.tsx"></script>
+  </body>
+</html>
